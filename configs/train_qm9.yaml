@@ -1,0 +1,236 @@
+seed: 42
+project: "equivariant-neural-diffusion"
+tags:
+  - qm9
+train: true
+
+log_dir: ${oc.env:LOG_PATH}
+output_dir: ${hydra:runtime.output_dir}
+work_dir: ${hydra:runtime.cwd}
+
+data_path: ${oc.env:DATA_PATH}/qm9/preprocessed
+infos_path: ${data_path}/train_infos.json
+data_name: "qm9"
+
+atom_types_int: [ 1, 6, 7, 8, 9 ]
+atom_types_str: [ "H", "C", "N", "O", "F" ]
+max_num_atoms: 29
+
+num_node_features: 5
+zero_cog: true
+use_context: false
+num_layers: 5
+hidden_scalar_dim: 256
+hidden_vector_dim: 256
+hidden_edge_dim: 64
+vector_aggr: mean
+max_distance: 12.0
+cutoff: true
+num_fourier_features: 16
+volatility: linear
+num_layers_readout: 2
+use_v_norm: true
+loss_weights:
+  pos: 0.375  # 3/8
+  h: 0.625    # 5/8
+
+
+monitor_metric: "val/molecule_stable"
+val_every_n_epochs: 5
+
+
+datamodule:
+  _target_: src_end.data.datamodule.DataModule
+  transform:
+    _target_: torch_geometric.transforms.Compose
+    transforms:
+      - _target_: src_end.data.transforms.OneHot
+        values: ${atom_types_int}
+        key: "h"
+        scale: 0.25
+        noise_std: 0.0
+
+      - _target_: src_end.data.transforms.FullyConnected
+        key: "edge_index"
+
+      - _target_: src_end.data.transforms.ZeroCoG
+        key: "pos"
+
+  train_path: ${data_path}/train.pt
+  val_path: ${data_path}/val.pt
+  train_batch_size: 64
+  val_batch_size: 256
+  num_val_subset: 2048
+  num_workers: 1
+  pin_memory: true
+  subset_seed: ${seed}
+
+
+lit_module:
+  _target_: src_end.lit.module.LitEND
+  model:
+    _target_: src_end.model.end.END
+    zero_cog_score: false
+    parameterization: "x0"
+    which_loss: "simple"
+    ###### Forward process
+    f:
+      _target_: src_end.model.parameterization.EquivariantParameterization
+      encoder:
+        _target_: src_end.nn.encoder.EquivEncoder
+        hparams:
+          _target_: src_end.nn.encoder.EquivEncoderHParams
+          num_layers: ${num_layers}
+          num_node_features: ${num_node_features}
+          hidden_scalar_dim: ${hidden_scalar_dim}
+          hidden_vector_dim: ${hidden_vector_dim}
+          hidden_edge_dim: ${hidden_edge_dim}
+          vector_aggr: ${vector_aggr}
+          zero_cog: ${zero_cog}
+          num_edge_features: ${hidden_edge_dim}
+          max_distance: ${max_distance}
+          cutoff: ${cutoff}
+          num_fourier_features: ${num_fourier_features}
+      readout:
+        _target_: src_end.model.forward.AffineReadout
+        hn_dim:
+          - ${hidden_scalar_dim}
+          - ${hidden_vector_dim}
+        num_node_features: ${num_node_features}
+        parameterization: "pinned"
+        zero_cog: ${zero_cog}
+        delta: 0.01
+        layer_norm: false
+        num_layers: ${num_layers_readout}
+        use_v_norm: ${use_v_norm}
+
+    ###### Reverse process ~ data point predictor
+    r:
+      _target_: src_end.model.parameterization.EquivariantParameterization
+      encoder:
+        _target_: src_end.nn.encoder.EquivEncoder
+        hparams:
+          _target_: src_end.nn.encoder.EquivEncoderHParams
+          num_layers: ${num_layers}
+          num_node_features: ${num_node_features}
+          hidden_scalar_dim: ${hidden_scalar_dim}
+          hidden_vector_dim: ${hidden_vector_dim}
+          hidden_edge_dim: ${hidden_edge_dim}
+          vector_aggr: ${vector_aggr}
+          zero_cog: ${zero_cog}
+          num_edge_features: ${hidden_edge_dim}
+          max_distance: ${max_distance}
+          cutoff: ${cutoff}
+          num_fourier_features: ${num_fourier_features}
+
+      readout:
+        _target_: src_end.model.reverse.DataPointReadout
+        hn_dim:
+          - ${hidden_scalar_dim}
+          - ${hidden_vector_dim}
+        out_dim: ${num_node_features}
+        parameterization: "residual-time-pos"
+        zero_cog: ${zero_cog}
+        num_layers: ${num_layers_readout}
+        layer_norm: false
+
+    ###### Volatility
+    g:
+      _target_: src_end.model.volatility.LinearVolatility
+      d: 2
+
+    ##### Distributions
+    p_eps:
+      _target_: src_end.model.distributions.GaussianDistribution
+      dim_h: ${num_node_features}
+      dim_pos: 3
+      zero_cog: ${zero_cog}
+
+    p_z1:
+      _target_: src_end.model.distributions.GaussianDistribution
+      dim_h: ${num_node_features}
+      dim_pos: 3
+      zero_cog: ${zero_cog}
+
+    p_w:
+      _target_: src_end.model.distributions.GaussianDistribution
+      dim_h: ${num_node_features}
+      dim_pos: 3
+      zero_cog: ${zero_cog}
+
+  metrics:
+    _target_: src_end.metrics.qm9.QM9Metrics
+    atom_types_str: ${atom_types_str}
+    max_num_atoms: ${max_num_atoms}
+    json_path: ${infos_path}
+
+
+  decoder: ${atom_types_str}
+  n_integration_steps: 250
+  lr: 2e-4
+  warm_up_steps: 100
+  with_ema: true
+  ema_start_step: 500
+  ema_decay: 0.999
+  antithetic_time_sampling: true
+  loss_weights: ${loss_weights}
+  loss_during_val: false
+
+
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+
+    dirpath: ${output_dir}/checkpoints
+    filename: "{epoch:03d}"
+    monitor: ${monitor_metric}
+    verbose: False
+    save_last: true
+    save_top_k: 3
+    mode: "max"
+    auto_insert_metric_name: true
+    save_weights_only: false
+    every_n_epochs: ${val_every_n_epochs}
+    save_on_train_epoch_end: true
+
+  log_sampled_atoms:
+    _target_: src_end.utils.callback.LogSampledAtomsCallback
+    dirpath: ${output_dir}/samples
+    save_atoms: true
+    num_log_wandb: 25
+
+logger:
+  wandb:
+    _target_: pytorch_lightning.loggers.wandb.WandbLogger
+    save_dir: ${output_dir}
+    offline: False
+    id: null
+    anonymous: null
+    project: ${project}
+    log_model: False
+    prefix: ""
+    group: ""
+    tags: ${tags}
+    job_type: ""
+
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: auto
+  devices: 1
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  max_epochs: 1000
+  check_val_every_n_epoch: ${val_every_n_epochs}
+  num_sanity_val_steps: 0
+
+
+hydra:
+  run:
+    dir: ${log_dir}/${data_name}/runs/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+
+
+
+
+
